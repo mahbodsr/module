@@ -1,14 +1,18 @@
 #ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
+#include <windows.h>
 #include <winsock2.h>
 #undef SERVER_EXECUTE
 #undef ARRAYSIZE
+#else
+#include <dlfcn.h>
 #endif
 
 #include <stdio.h>
 #include <string.h>
 #include "extdll.h"
 #include "meta_api.h"
+#include "rehlds_api.h"
 #include <hiredis/hiredis.h>
 
 plugin_info_t Plugin_info = {
@@ -23,16 +27,52 @@ mutil_funcs_t *gpMetaUtilFuncs;
 enginefuncs_t g_engfuncs;
 globalvars_t *gpGlobals;
 
+// ReHLDS API Pointers
+IRehldsApi* g_RehldsApi = nullptr;
+IRehldsServerData* g_RehldsData = nullptr;
+
+enum AuthState {
+    STATE_DISCONNECTED = 0,
+    STATE_WAITING_FOR_REUNION,
+    STATE_AUTHENTICATED
+};
+
 char g_ApprovedSteamID[33][32] = {0};
+AuthState g_PlayerState[33] = {STATE_DISCONNECTED};
 
 C_DLLEXPORT void WINAPI GiveFnptrsToDll(enginefuncs_t* pengfuncsFromEngine, globalvars_t *pGlobals) {
     memcpy(&g_engfuncs, pengfuncsFromEngine, sizeof(enginefuncs_t));
     gpGlobals = pGlobals;
 }
 
+// ------------------------------------------------------------------------
+// ReHLDS Factory Loader (Cross-Platform)
+// ------------------------------------------------------------------------
+typedef void* (*CreateInterfaceFn)(const char *pName, int *pReturnCode);
+CreateInterfaceFn GetEngineFactory() {
+#ifdef _WIN32
+    HMODULE hModule = GetModuleHandleA("swds.dll");
+    if (!hModule) hModule = GetModuleHandleA("hw.dll");
+    if (!hModule) return nullptr;
+    return (CreateInterfaceFn)GetProcAddress(hModule, "CreateInterface");
+#else
+    void *hModule = dlopen("engine_i486.so", RTLD_NOW);
+    if (!hModule) return nullptr;
+    auto factory = (CreateInterfaceFn)dlsym(hModule, "CreateInterface");
+    dlclose(hModule);
+    return factory;
+#endif
+}
+
+// ------------------------------------------------------------------------
+// STEP 1: Catch connection & fetch from Redis
+// ------------------------------------------------------------------------
 qboolean ClientConnect_Hook(edict_t *pEntity, const char *pszName, const char *pszAddress, char szRejectReason[128]) {
     int index = g_engfuncs.pfnIndexOfEdict(pEntity);
-    if (index > 0 && index <= 32) g_ApprovedSteamID[index][0] = '\0';
+    if (index > 0 && index <= 32) {
+        g_ApprovedSteamID[index][0] = '\0';
+        g_PlayerState[index] = STATE_DISCONNECTED;
+    }
 
     if (!redis || redis->err) {
         RETURN_META_VALUE(MRES_IGNORED, TRUE); 
@@ -66,30 +106,11 @@ qboolean ClientConnect_Hook(edict_t *pEntity, const char *pszName, const char *p
         }
 
         if (extractedSteamId[0] != '\0') {
-            gpMetaUtilFuncs->pfnLogConsole(PLID, "\n============================================\n");
-            gpMetaUtilFuncs->pfnLogConsole(PLID, "[WebAuth] PHASE 1: ClientConnect (%s)\n", pszName);
-            gpMetaUtilFuncs->pfnLogConsole(PLID, "[WebAuth] Extracted Target ID: %s\n", extractedSteamId);
-            
             if (index > 0 && index <= 32) {
                 strncpy(g_ApprovedSteamID[index], extractedSteamId, 31);
                 g_ApprovedSteamID[index][31] = '\0';
+                g_PlayerState[index] = STATE_WAITING_FOR_REUNION;
             }
-
-            char* engine_authid = (char*)g_engfuncs.pfnGetPlayerAuthId(pEntity);
-            if (engine_authid) {
-                gpMetaUtilFuncs->pfnLogConsole(PLID, "[WebAuth] Engine Memory BEFORE write: %s\n", engine_authid);
-                
-                // Write the ID directly to memory
-                strncpy(engine_authid, extractedSteamId, 31);
-                engine_authid[31] = '\0';
-                
-                // Immediately read it back to verify C++ didn't fail
-                gpMetaUtilFuncs->pfnLogConsole(PLID, "[WebAuth] Engine Memory AFTER write: %s\n", (char*)g_engfuncs.pfnGetPlayerAuthId(pEntity));
-            } else {
-                gpMetaUtilFuncs->pfnLogConsole(PLID, "[WebAuth] ERROR: pfnGetPlayerAuthId returned NULL pointer!\n");
-            }
-            gpMetaUtilFuncs->pfnLogConsole(PLID, "============================================\n\n");
-
             freeReplyObject(reply);
             RETURN_META_VALUE(MRES_IGNORED, TRUE); 
         } else {
@@ -104,30 +125,54 @@ qboolean ClientConnect_Hook(edict_t *pEntity, const char *pszName, const char *p
     }
 }
 
-// Check the memory again when they actually spawn in. 
-// If the engine itself is overwriting our changes after ClientConnect, we will catch it here.
-void ClientPutInServer_Hook(edict_t *pEntity) {
-    int index = g_engfuncs.pfnIndexOfEdict(pEntity);
-    if (index > 0 && index <= 32 && g_ApprovedSteamID[index][0] != '\0') {
+// ------------------------------------------------------------------------
+// STEP 2: The True ReHLDS Memory Stomp
+// ------------------------------------------------------------------------
+void StompAuthID(int index) {
+    if (!g_RehldsData) return;
+    
+    if (index > 0 && index <= 32 && g_PlayerState[index] == STATE_WAITING_FOR_REUNION) {
         
-        char* engine_authid = (char*)g_engfuncs.pfnGetPlayerAuthId(pEntity);
+        // ReHLDS GetClient expects a 0-based index (0 to 31)
+        IRehldsClient* pClient = g_RehldsData->GetClient(index - 1);
         
-        gpMetaUtilFuncs->pfnLogConsole(PLID, "\n============================================\n");
-        gpMetaUtilFuncs->pfnLogConsole(PLID, "[WebAuth] PHASE 2: ClientPutInServer\n");
-        gpMetaUtilFuncs->pfnLogConsole(PLID, "[WebAuth] Current Engine Memory: %s\n", engine_authid);
-        
-        if (engine_authid && strcmp(engine_authid, g_ApprovedSteamID[index]) != 0) {
-            gpMetaUtilFuncs->pfnLogConsole(PLID, "[WebAuth] WARNING: Engine reverted our ID back to %s!\n", engine_authid);
-            gpMetaUtilFuncs->pfnLogConsole(PLID, "[WebAuth] RE-APPLYING: %s...\n", g_ApprovedSteamID[index]);
+        if (pClient && pClient->IsConnected()) {
             
-            strncpy(engine_authid, g_ApprovedSteamID[index], 31);
-            engine_authid[31] = '\0';
+            // Bypass Metamod completely and fetch the exact memory pointer from the ReHLDS engine
+            char* engine_authid = const_cast<char*>(pClient->GetAuthId());
             
-            gpMetaUtilFuncs->pfnLogConsole(PLID, "[WebAuth] FINAL VERIFY: %s\n", (char*)g_engfuncs.pfnGetPlayerAuthId(pEntity));
-        } else {
-            gpMetaUtilFuncs->pfnLogConsole(PLID, "[WebAuth] SUCCESS: Engine retained our SteamID correctly.\n");
+            // If Reunion has finished generating its dummy ID and it is no longer PENDING...
+            if (engine_authid && 
+                strcmp(engine_authid, "STEAM_ID_PENDING") != 0 && 
+                strcmp(engine_authid, "BOT") != 0 && 
+                engine_authid[0] != '\0') 
+            {
+                gpMetaUtilFuncs->pfnLogConsole(PLID, "[WebAuth] Reunion finished! Stomping '%s' with Redis ID '%s'\n", engine_authid, g_ApprovedSteamID[index]);
+                
+                // Write directly into ReHLDS core memory
+                strncpy(engine_authid, g_ApprovedSteamID[index], 31);
+                engine_authid[31] = '\0';
+                
+                g_PlayerState[index] = STATE_AUTHENTICATED;
+            }
         }
-        gpMetaUtilFuncs->pfnLogConsole(PLID, "============================================\n\n");
+    }
+}
+
+// Surround AMX Mod X on all fronts to guarantee we stomp before it reads
+void ClientUserInfoChanged_Hook(edict_t *pEntity, char *infobuffer) {
+    StompAuthID(g_engfuncs.pfnIndexOfEdict(pEntity));
+    RETURN_META(MRES_IGNORED);
+}
+
+void PlayerPreThink_Hook(edict_t *pEntity) {
+    StompAuthID(g_engfuncs.pfnIndexOfEdict(pEntity));
+    RETURN_META(MRES_IGNORED);
+}
+
+void StartFrame_Hook() {
+    for (int i = 1; i <= gpGlobals->maxClients; i++) {
+        StompAuthID(i);
     }
     RETURN_META(MRES_IGNORED);
 }
@@ -136,6 +181,7 @@ void ClientDisconnect_Hook(edict_t *pEntity) {
     int index = g_engfuncs.pfnIndexOfEdict(pEntity);
     if (index > 0 && index <= 32) {
         g_ApprovedSteamID[index][0] = '\0'; 
+        g_PlayerState[index] = STATE_DISCONNECTED;
     }
     RETURN_META(MRES_IGNORED);
 }
@@ -144,8 +190,10 @@ C_DLLEXPORT int GetEntityAPI(DLL_FUNCTIONS *pFunctionTable, int interfaceVersion
     if (!pFunctionTable) return FALSE;
     memset(pFunctionTable, 0, sizeof(DLL_FUNCTIONS));
     pFunctionTable->pfnClientConnect = ClientConnect_Hook;
-    pFunctionTable->pfnClientPutInServer = ClientPutInServer_Hook;
     pFunctionTable->pfnClientDisconnect = ClientDisconnect_Hook;
+    pFunctionTable->pfnClientUserInfoChanged = ClientUserInfoChanged_Hook;
+    pFunctionTable->pfnPlayerPreThink = PlayerPreThink_Hook;
+    pFunctionTable->pfnStartFrame = StartFrame_Hook;
     return TRUE;
 }
 
@@ -163,6 +211,19 @@ C_DLLEXPORT int Meta_Attach(PLUG_LOADTIME now, META_FUNCTIONS *pFunctionTable, m
     WSADATA wsaData;
     WSAStartup(MAKEWORD(2,2), &wsaData);
 #endif
+
+    // Hook directly into the ReHLDS API
+    CreateInterfaceFn factory = GetEngineFactory();
+    if (factory) {
+        int ret;
+        g_RehldsApi = (IRehldsApi*)factory("VREHLDS_API_VERSION001", &ret);
+        if (g_RehldsApi) {
+            g_RehldsData = g_RehldsApi->GetServerData();
+            gpMetaUtilFuncs->pfnLogConsole(PLID, "[WebAuth] ReHLDS API successfully linked!\n");
+        }
+    } else {
+        gpMetaUtilFuncs->pfnLogConsole(PLID, "[WebAuth] WARNING: Could not hook ReHLDS API.\n");
+    }
 
     redis = redisConnect("127.0.0.1", 6379);
     if (redis == nullptr || redis->err) {
