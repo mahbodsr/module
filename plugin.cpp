@@ -23,12 +23,17 @@ mutil_funcs_t *gpMetaUtilFuncs;
 enginefuncs_t g_engfuncs;
 globalvars_t *gpGlobals;
 
+char g_ApprovedSteamID[33][32] = {0};
+
 C_DLLEXPORT void WINAPI GiveFnptrsToDll(enginefuncs_t* pengfuncsFromEngine, globalvars_t *pGlobals) {
     memcpy(&g_engfuncs, pengfuncsFromEngine, sizeof(enginefuncs_t));
     gpGlobals = pGlobals;
 }
 
 qboolean ClientConnect_Hook(edict_t *pEntity, const char *pszName, const char *pszAddress, char szRejectReason[128]) {
+    int index = g_engfuncs.pfnIndexOfEdict(pEntity);
+    if (index > 0 && index <= 32) g_ApprovedSteamID[index][0] = '\0';
+
     if (!redis || redis->err) {
         RETURN_META_VALUE(MRES_IGNORED, TRUE); 
     }
@@ -61,17 +66,32 @@ qboolean ClientConnect_Hook(edict_t *pEntity, const char *pszName, const char *p
         }
 
         if (extractedSteamId[0] != '\0') {
+            gpMetaUtilFuncs->pfnLogConsole(PLID, "\n============================================\n");
+            gpMetaUtilFuncs->pfnLogConsole(PLID, "[WebAuth] PHASE 1: ClientConnect (%s)\n", pszName);
+            gpMetaUtilFuncs->pfnLogConsole(PLID, "[WebAuth] Extracted Target ID: %s\n", extractedSteamId);
             
-            // THE DIRECT ASSIGNMENT:
-            // Bypass the read-only lock and forcefully write the Redis ID into the engine's memory.
-            char* engine_authid = (char*)g_engfuncs.pfnGetPlayerAuthId(pEntity);
-            if (engine_authid) {
-                strncpy(engine_authid, extractedSteamId, 31);
-                engine_authid[31] = '\0';
+            if (index > 0 && index <= 32) {
+                strncpy(g_ApprovedSteamID[index], extractedSteamId, 31);
+                g_ApprovedSteamID[index][31] = '\0';
             }
 
+            char* engine_authid = (char*)g_engfuncs.pfnGetPlayerAuthId(pEntity);
+            if (engine_authid) {
+                gpMetaUtilFuncs->pfnLogConsole(PLID, "[WebAuth] Engine Memory BEFORE write: %s\n", engine_authid);
+                
+                // Write the ID directly to memory
+                strncpy(engine_authid, extractedSteamId, 31);
+                engine_authid[31] = '\0';
+                
+                // Immediately read it back to verify C++ didn't fail
+                gpMetaUtilFuncs->pfnLogConsole(PLID, "[WebAuth] Engine Memory AFTER write: %s\n", (char*)g_engfuncs.pfnGetPlayerAuthId(pEntity));
+            } else {
+                gpMetaUtilFuncs->pfnLogConsole(PLID, "[WebAuth] ERROR: pfnGetPlayerAuthId returned NULL pointer!\n");
+            }
+            gpMetaUtilFuncs->pfnLogConsole(PLID, "============================================\n\n");
+
             freeReplyObject(reply);
-            RETURN_META_VALUE(MRES_IGNORED, TRUE); // Let them join
+            RETURN_META_VALUE(MRES_IGNORED, TRUE); 
         } else {
             if (reply) freeReplyObject(reply);
             strncpy(szRejectReason, "Invalid session data format!", 127);
@@ -84,10 +104,48 @@ qboolean ClientConnect_Hook(edict_t *pEntity, const char *pszName, const char *p
     }
 }
 
+// Check the memory again when they actually spawn in. 
+// If the engine itself is overwriting our changes after ClientConnect, we will catch it here.
+void ClientPutInServer_Hook(edict_t *pEntity) {
+    int index = g_engfuncs.pfnIndexOfEdict(pEntity);
+    if (index > 0 && index <= 32 && g_ApprovedSteamID[index][0] != '\0') {
+        
+        char* engine_authid = (char*)g_engfuncs.pfnGetPlayerAuthId(pEntity);
+        
+        gpMetaUtilFuncs->pfnLogConsole(PLID, "\n============================================\n");
+        gpMetaUtilFuncs->pfnLogConsole(PLID, "[WebAuth] PHASE 2: ClientPutInServer\n");
+        gpMetaUtilFuncs->pfnLogConsole(PLID, "[WebAuth] Current Engine Memory: %s\n", engine_authid);
+        
+        if (engine_authid && strcmp(engine_authid, g_ApprovedSteamID[index]) != 0) {
+            gpMetaUtilFuncs->pfnLogConsole(PLID, "[WebAuth] WARNING: Engine reverted our ID back to %s!\n", engine_authid);
+            gpMetaUtilFuncs->pfnLogConsole(PLID, "[WebAuth] RE-APPLYING: %s...\n", g_ApprovedSteamID[index]);
+            
+            strncpy(engine_authid, g_ApprovedSteamID[index], 31);
+            engine_authid[31] = '\0';
+            
+            gpMetaUtilFuncs->pfnLogConsole(PLID, "[WebAuth] FINAL VERIFY: %s\n", (char*)g_engfuncs.pfnGetPlayerAuthId(pEntity));
+        } else {
+            gpMetaUtilFuncs->pfnLogConsole(PLID, "[WebAuth] SUCCESS: Engine retained our SteamID correctly.\n");
+        }
+        gpMetaUtilFuncs->pfnLogConsole(PLID, "============================================\n\n");
+    }
+    RETURN_META(MRES_IGNORED);
+}
+
+void ClientDisconnect_Hook(edict_t *pEntity) {
+    int index = g_engfuncs.pfnIndexOfEdict(pEntity);
+    if (index > 0 && index <= 32) {
+        g_ApprovedSteamID[index][0] = '\0'; 
+    }
+    RETURN_META(MRES_IGNORED);
+}
+
 C_DLLEXPORT int GetEntityAPI(DLL_FUNCTIONS *pFunctionTable, int interfaceVersion) {
     if (!pFunctionTable) return FALSE;
     memset(pFunctionTable, 0, sizeof(DLL_FUNCTIONS));
     pFunctionTable->pfnClientConnect = ClientConnect_Hook;
+    pFunctionTable->pfnClientPutInServer = ClientPutInServer_Hook;
+    pFunctionTable->pfnClientDisconnect = ClientDisconnect_Hook;
     return TRUE;
 }
 
