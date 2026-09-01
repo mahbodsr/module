@@ -17,8 +17,6 @@ plugin_info_t Plugin_info = {
 };
 
 redisContext* redis = nullptr;
-
-// Standard Metamod Globals
 meta_globals_t *gpMetaGlobals;
 gamedll_funcs_t *gpGamedllFuncs;
 mutil_funcs_t *gpMetaUtilFuncs;
@@ -30,7 +28,6 @@ C_DLLEXPORT void WINAPI GiveFnptrsToDll(enginefuncs_t* pengfuncsFromEngine, glob
     gpGlobals = pGlobals;
 }
 
-// Our Metamod Hook for Player Connections
 qboolean ClientConnect_Hook(edict_t *pEntity, const char *pszName, const char *pszAddress, char szRejectReason[128]) {
     if (!redis || redis->err) {
         RETURN_META_VALUE(MRES_IGNORED, TRUE); 
@@ -45,26 +42,51 @@ qboolean ClientConnect_Hook(edict_t *pEntity, const char *pszName, const char *p
     redisReply* reply = (redisReply*)redisCommand(redis, "GET session:%s", ip);
     
     if (reply != nullptr && reply->type == REDIS_REPLY_STRING) {
+        // 1. Log the raw data from Redis to the server console
+        gpMetaUtilFuncs->pfnLogConsole(PLID, "[WebAuth] Raw Redis Data for %s: %s\n", ip, reply->str);
+
+        char extractedSteamId[64] = {0};
         
-        // --- THE STEAMID OVERWRITE ---
-        // 1. Get the memory address of the player's SteamID inside the engine
-        char* engine_authid = (char*)g_engfuncs.pfnGetPlayerAuthId(pEntity);
-        
-        // 2. Overwrite the engine's memory with the SteamID from Redis
-        if (engine_authid) {
-            strncpy(engine_authid, reply->str, 31);
-            engine_authid[31] = '\0';
+        // 2. Extract the SteamID (Looks for "steamId":"STEAM_...")
+        char* steamKey = strstr(reply->str, "\"steamId\":\"");
+        if (steamKey) {
+            steamKey += 11; // Move past the key string
+            char* endQuote = strchr(steamKey, '"');
+            if (endQuote) {
+                int length = endQuote - steamKey;
+                if (length > 0 && length < 64) {
+                    strncpy(extractedSteamId, steamKey, length);
+                    extractedSteamId[length] = '\0';
+                }
+            }
+        } else if (strncmp(reply->str, "STEAM_", 6) == 0) {
+            // Fallback: If Redis just returns the raw string without JSON
+            strncpy(extractedSteamId, reply->str, 31);
+            extractedSteamId[31] = '\0';
         }
-        
-        freeReplyObject(reply);
-        RETURN_META_VALUE(MRES_IGNORED, TRUE); // Let them join
+
+        // 3. Overwrite engine memory
+        if (extractedSteamId[0] != '\0') {
+            gpMetaUtilFuncs->pfnLogConsole(PLID, "[WebAuth] Success! Extracted SteamID: %s\n", extractedSteamId);
+            
+            char* engine_authid = (char*)g_engfuncs.pfnGetPlayerAuthId(pEntity);
+            if (engine_authid) {
+                strncpy(engine_authid, extractedSteamId, 31);
+                engine_authid[31] = '\0';
+            }
+            
+            freeReplyObject(reply);
+            RETURN_META_VALUE(MRES_IGNORED, TRUE);
+        } else {
+            gpMetaUtilFuncs->pfnLogConsole(PLID, "[WebAuth] Failed to parse SteamID from Redis string.\n");
+            if (reply) freeReplyObject(reply);
+            strncpy(szRejectReason, "Invalid session data format!", 127);
+            RETURN_META_VALUE(MRES_SUPERCEDE, FALSE);
+        }
     } else {
         if (reply) freeReplyObject(reply);
-        
         strncpy(szRejectReason, "Please login to the website first!", 127);
-        szRejectReason[127] = '\0';
-        
-        RETURN_META_VALUE(MRES_SUPERCEDE, FALSE); // Reject connection
+        RETURN_META_VALUE(MRES_SUPERCEDE, FALSE);
     }
 }
 
