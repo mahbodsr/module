@@ -23,12 +23,19 @@ mutil_funcs_t *gpMetaUtilFuncs;
 enginefuncs_t g_engfuncs;
 globalvars_t *gpGlobals;
 
+// Store the approved Redis SteamID temporarily while they connect
+char g_ApprovedSteamID[33][32] = {0};
+
 C_DLLEXPORT void WINAPI GiveFnptrsToDll(enginefuncs_t* pengfuncsFromEngine, globalvars_t *pGlobals) {
     memcpy(&g_engfuncs, pengfuncsFromEngine, sizeof(enginefuncs_t));
     gpGlobals = pGlobals;
 }
 
+// STEP 1: The Security Guard (Check Redis and Kick if invalid)
 qboolean ClientConnect_Hook(edict_t *pEntity, const char *pszName, const char *pszAddress, char szRejectReason[128]) {
+    int index = g_engfuncs.pfnIndexOfEdict(pEntity);
+    if (index > 0 && index <= 32) g_ApprovedSteamID[index][0] = '\0';
+
     if (!redis || redis->err) {
         RETURN_META_VALUE(MRES_IGNORED, TRUE); 
     }
@@ -42,58 +49,75 @@ qboolean ClientConnect_Hook(edict_t *pEntity, const char *pszName, const char *p
     redisReply* reply = (redisReply*)redisCommand(redis, "GET session:%s", ip);
     
     if (reply != nullptr && reply->type == REDIS_REPLY_STRING) {
-        // 1. Log the raw data from Redis to the server console
-        gpMetaUtilFuncs->pfnLogConsole(PLID, "[WebAuth] Raw Redis Data for %s: %s\n", ip, reply->str);
-
         char extractedSteamId[64] = {0};
         
-        // 2. Extract the SteamID (Looks for "steamId":"STEAM_...")
         char* steamKey = strstr(reply->str, "\"steamId\":\"");
         if (steamKey) {
-            steamKey += 11; // Move past the key string
+            steamKey += 11;
             char* endQuote = strchr(steamKey, '"');
             if (endQuote) {
                 int length = endQuote - steamKey;
-                if (length > 0 && length < 64) {
+                if (length > 0 && length < 32) {
                     strncpy(extractedSteamId, steamKey, length);
                     extractedSteamId[length] = '\0';
                 }
             }
         } else if (strncmp(reply->str, "STEAM_", 6) == 0) {
-            // Fallback: If Redis just returns the raw string without JSON
             strncpy(extractedSteamId, reply->str, 31);
             extractedSteamId[31] = '\0';
         }
 
-        // 3. Overwrite engine memory
         if (extractedSteamId[0] != '\0') {
-            gpMetaUtilFuncs->pfnLogConsole(PLID, "[WebAuth] Success! Extracted SteamID: %s\n", extractedSteamId);
-            
-            char* engine_authid = (char*)g_engfuncs.pfnGetPlayerAuthId(pEntity);
-            if (engine_authid) {
-                strncpy(engine_authid, extractedSteamId, 31);
-                engine_authid[31] = '\0';
+            // Authorized! Save the ID in memory to apply it later.
+            if (index > 0 && index <= 32) {
+                strncpy(g_ApprovedSteamID[index], extractedSteamId, 31);
+                g_ApprovedSteamID[index][31] = '\0';
             }
             
             freeReplyObject(reply);
-            RETURN_META_VALUE(MRES_IGNORED, TRUE);
+            RETURN_META_VALUE(MRES_IGNORED, TRUE); // Let them in
         } else {
-            gpMetaUtilFuncs->pfnLogConsole(PLID, "[WebAuth] Failed to parse SteamID from Redis string.\n");
             if (reply) freeReplyObject(reply);
             strncpy(szRejectReason, "Invalid session data format!", 127);
-            RETURN_META_VALUE(MRES_SUPERCEDE, FALSE);
+            RETURN_META_VALUE(MRES_SUPERCEDE, FALSE); // Kick
         }
     } else {
         if (reply) freeReplyObject(reply);
         strncpy(szRejectReason, "Please login to the website first!", 127);
-        RETURN_META_VALUE(MRES_SUPERCEDE, FALSE);
+        RETURN_META_VALUE(MRES_SUPERCEDE, FALSE); // Kick
     }
+}
+
+// STEP 2: The Overwrite (Runs after Reunion is 100% finished generating its dummy ID)
+void ClientPutInServer_Hook(edict_t *pEntity) {
+    int index = g_engfuncs.pfnIndexOfEdict(pEntity);
+    
+    if (index > 0 && index <= 32 && g_ApprovedSteamID[index][0] != '\0') {
+        char* engine_authid = (char*)g_engfuncs.pfnGetPlayerAuthId(pEntity);
+        if (engine_authid) {
+            // Overwrite Reunion's dummy ID permanently
+            strncpy(engine_authid, g_ApprovedSteamID[index], 31);
+            engine_authid[31] = '\0';
+        }
+    }
+    RETURN_META(MRES_IGNORED);
+}
+
+// STEP 3: Memory Cleanup
+void ClientDisconnect_Hook(edict_t *pEntity) {
+    int index = g_engfuncs.pfnIndexOfEdict(pEntity);
+    if (index > 0 && index <= 32) {
+        g_ApprovedSteamID[index][0] = '\0'; 
+    }
+    RETURN_META(MRES_IGNORED);
 }
 
 C_DLLEXPORT int GetEntityAPI(DLL_FUNCTIONS *pFunctionTable, int interfaceVersion) {
     if (!pFunctionTable) return FALSE;
     memset(pFunctionTable, 0, sizeof(DLL_FUNCTIONS));
     pFunctionTable->pfnClientConnect = ClientConnect_Hook;
+    pFunctionTable->pfnClientPutInServer = ClientPutInServer_Hook;
+    pFunctionTable->pfnClientDisconnect = ClientDisconnect_Hook;
     return TRUE;
 }
 
@@ -124,7 +148,6 @@ C_DLLEXPORT int Meta_Attach(PLUG_LOADTIME now, META_FUNCTIONS *pFunctionTable, m
 
 C_DLLEXPORT int Meta_Detach(PLUG_LOADTIME now, PL_UNLOAD_REASON reason) {
     if (redis) redisFree(redis);
-
 #ifdef _WIN32
     WSACleanup();
 #endif
