@@ -120,8 +120,8 @@ C_DLLEXPORT int GetEntityAPI(DLL_FUNCTIONS *pFunctionTable, int interfaceVersion
     return TRUE;
 }
 
-// Register our Engine Hooks
-C_DLLEXPORT int GetEngineAPI(enginefuncs_t *pengfuncsFromEngine, int *interfaceVersion) {
+// Register our Engine Hooks (Fixed function name)
+C_DLLEXPORT int GetEngineFunctions(enginefuncs_t *pengfuncsFromEngine, int *interfaceVersion) {
     if (!pengfuncsFromEngine) return FALSE;
     memset(pengfuncsFromEngine, 0, sizeof(enginefuncs_t));
     pengfuncsFromEngine->pfnGetPlayerAuthId = Hook_GetPlayerAuthId;
@@ -149,9 +149,9 @@ C_DLLEXPORT int Meta_Attach(PLUG_LOADTIME now, META_FUNCTIONS *pFunctionTable, m
         return FALSE;
     }
 
-    // Tell Metamod we have both Entity hooks and Engine hooks
+    // Tell Metamod we have both Entity hooks and Engine hooks (Fixed member name)
     pFunctionTable->pfnGetEntityAPI = GetEntityAPI;
-    pFunctionTable->pfnGetEngineAPI = GetEngineAPI;
+    pFunctionTable->pfnGetEngineFunctions = GetEngineFunctions;
     return TRUE;
 }
 
