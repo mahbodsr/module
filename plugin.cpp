@@ -12,7 +12,7 @@
 #include <hiredis/hiredis.h>
 
 plugin_info_t Plugin_info = {
-    META_INTERFACE_VERSION, "WebAuth", "1.0", "2026-08", "YourName", 
+    META_INTERFACE_VERSION, "WebAuth", "1.1", "2026-08", "YourName", 
     "https://yoursite.com", "WEBAUTH", PT_ANYTIME, PT_ANYTIME
 };
 
@@ -29,7 +29,7 @@ C_DLLEXPORT void WINAPI GiveFnptrsToDll(enginefuncs_t* pengfuncsFromEngine, glob
     gpGlobals = pGlobals;
 }
 
-// Hook to override SteamID for API requests (AMXX, etc.)
+// Intercept standard API requests (AMXX, etc.)
 const char* GetPlayerAuthId_Hook(edict_t *pEntity) {
     if (!pEntity || pEntity->v.flags & FL_DORMANT) {
         RETURN_META_VALUE(MRES_IGNORED, NULL);
@@ -39,6 +39,19 @@ const char* GetPlayerAuthId_Hook(edict_t *pEntity) {
         RETURN_META_VALUE(MRES_SUPERCEDE, webAuthId);
     }
     RETURN_META_VALUE(MRES_IGNORED, NULL);
+}
+
+// Re-applies the memory overwrite to bypass ReHLDS native `status` and ReUnion overrides
+void EnforceSteamIDInMemory(edict_t *pEntity) {
+    const char* webAuthId = g_engfuncs.pfnInfoKeyValue(g_engfuncs.pfnGetInfoKeyBuffer(pEntity), "*web_auth_id");
+    if (webAuthId && webAuthId[0] != '\0') {
+        const char* engineAuthId = g_engfuncs.pfnGetPlayerAuthId(pEntity);
+        if (engineAuthId && strcmp(engineAuthId, webAuthId) != 0) {
+            // Force overwrite the internal ReHLDS client_t buffer
+            strncpy((char*)engineAuthId, webAuthId, 63); 
+            ((char*)engineAuthId)[63] = '\0';
+        }
+    }
 }
 
 qboolean ClientConnect_Hook(edict_t *pEntity, const char *pszName, const char *pszAddress, char szRejectReason[128]) {
@@ -54,18 +67,11 @@ qboolean ClientConnect_Hook(edict_t *pEntity, const char *pszName, const char *p
     redisReply* reply = (redisReply*)redisCommand(redis, "GET session:%s", ip);
     
     if (reply != nullptr && reply->type == REDIS_REPLY_STRING) {
-        // 1. Set the info buffer so our API hook and AMXX plugins can use it safely
+        // Store it in the info buffer for later retrieval
         g_engfuncs.pfnSetClientKeyValue(ENTINDEX(pEntity), g_engfuncs.pfnGetInfoKeyBuffer(pEntity), "*web_auth_id", reply->str);
         
-        // 2. FORCE OVERWRITE the engine's internal AuthID buffer.
-        // This is what the native "status" command reads from.
-        const char* engineAuthId = g_engfuncs.pfnGetPlayerAuthId(pEntity);
-        if (engineAuthId) {
-            // We cast away 'const' to modify the internal client_t structure in-place.
-            // ReHLDS/HLDS max authid length is typically 64 bytes.
-            strncpy((char*)engineAuthId, reply->str, 63); 
-            ((char*)engineAuthId)[63] = '\0';
-        }
+        // Initial enforcement
+        EnforceSteamIDInMemory(pEntity);
 
         freeReplyObject(reply);
         RETURN_META_VALUE(MRES_IGNORED, TRUE);
@@ -77,10 +83,24 @@ qboolean ClientConnect_Hook(edict_t *pEntity, const char *pszName, const char *p
     }
 }
 
+// Hook when player has fully loaded into the server (ReUnion auth is completely done by now)
+void ClientPutInServer_Hook(edict_t *pEntity) {
+    EnforceSteamIDInMemory(pEntity);
+    RETURN_META(MRES_IGNORED);
+}
+
+// Hook whenever client data updates to prevent ReUnion/Engine from resetting it
+void ClientUserInfoChanged_Hook(edict_t *pEntity, char *infobuffer) {
+    EnforceSteamIDInMemory(pEntity);
+    RETURN_META(MRES_IGNORED);
+}
+
 C_DLLEXPORT int GetEntityAPI(DLL_FUNCTIONS *pFunctionTable, int interfaceVersion) {
     if (!pFunctionTable) return FALSE;
     memset(pFunctionTable, 0, sizeof(DLL_FUNCTIONS));
     pFunctionTable->pfnClientConnect = ClientConnect_Hook;
+    pFunctionTable->pfnClientPutInServer = ClientPutInServer_Hook;
+    pFunctionTable->pfnClientUserInfoChanged = ClientUserInfoChanged_Hook;
     return TRUE;
 }
 
