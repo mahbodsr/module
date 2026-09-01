@@ -23,29 +23,12 @@ mutil_funcs_t *gpMetaUtilFuncs;
 enginefuncs_t g_engfuncs;
 globalvars_t *gpGlobals;
 
-// State machine to track when Reunion finishes assigning an ID
-enum AuthState {
-    STATE_DISCONNECTED = 0,
-    STATE_WAITING_FOR_REUNION,
-    STATE_AUTHENTICATED
-};
-
-char g_ApprovedSteamID[33][32] = {0};
-AuthState g_PlayerState[33] = {STATE_DISCONNECTED};
-
 C_DLLEXPORT void WINAPI GiveFnptrsToDll(enginefuncs_t* pengfuncsFromEngine, globalvars_t *pGlobals) {
     memcpy(&g_engfuncs, pengfuncsFromEngine, sizeof(enginefuncs_t));
     gpGlobals = pGlobals;
 }
 
-// 1. Initial Connection: Check Redis and flag the player to be watched
 qboolean ClientConnect_Hook(edict_t *pEntity, const char *pszName, const char *pszAddress, char szRejectReason[128]) {
-    int index = g_engfuncs.pfnIndexOfEdict(pEntity);
-    if (index > 0 && index <= 32) {
-        g_ApprovedSteamID[index][0] = '\0';
-        g_PlayerState[index] = STATE_DISCONNECTED;
-    }
-
     if (!redis || redis->err) {
         RETURN_META_VALUE(MRES_IGNORED, TRUE); 
     }
@@ -78,12 +61,9 @@ qboolean ClientConnect_Hook(edict_t *pEntity, const char *pszName, const char *p
         }
 
         if (extractedSteamId[0] != '\0') {
-            if (index > 0 && index <= 32) {
-                // Save the ID and flag the player to be watched for Reunion's dummy ID
-                strncpy(g_ApprovedSteamID[index], extractedSteamId, 31);
-                g_ApprovedSteamID[index][31] = '\0';
-                g_PlayerState[index] = STATE_WAITING_FOR_REUNION;
-            }
+            // Write the true Redis SteamID into the engine's Info Buffer so AMXX can grab it securely
+            int index = g_engfuncs.pfnIndexOfEdict(pEntity);
+            g_engfuncs.pfnSetClientKeyValue(index, g_engfuncs.pfnGetInfoKeyBuffer(pEntity), "*webauth", extractedSteamId);
             
             freeReplyObject(reply);
             RETURN_META_VALUE(MRES_IGNORED, TRUE); 
@@ -99,51 +79,10 @@ qboolean ClientConnect_Hook(edict_t *pEntity, const char *pszName, const char *p
     }
 }
 
-// 2. The Intercept: Catch Reunion before AMX Mod X sees it
-void StartFrame_Hook() {
-    for (int i = 1; i <= gpGlobals->maxClients; i++) {
-        // Only run CPU cycles for players actively connecting
-        if (g_PlayerState[i] == STATE_WAITING_FOR_REUNION) {
-            edict_t* pEntity = g_engfuncs.pfnPEntityOfEntIndex(i);
-            
-            if (pEntity && !pEntity->free) {
-                char* engine_authid = (char*)g_engfuncs.pfnGetPlayerAuthId(pEntity);
-                
-                // If Reunion changed it from PENDING to its dummy ID...
-                if (engine_authid && 
-                    strcmp(engine_authid, "STEAM_ID_PENDING") != 0 && 
-                    strcmp(engine_authid, "BOT") != 0 && 
-                    engine_authid[0] != '\0') 
-                {
-                    // STOMP Reunion's dummy ID with the Redis ID
-                    strncpy(engine_authid, g_ApprovedSteamID[i], 31);
-                    engine_authid[31] = '\0';
-                    
-                    // Mark as authenticated so we never check this player again
-                    g_PlayerState[i] = STATE_AUTHENTICATED;
-                }
-            }
-        }
-    }
-    RETURN_META(MRES_IGNORED);
-}
-
-// 3. Cleanup
-void ClientDisconnect_Hook(edict_t *pEntity) {
-    int index = g_engfuncs.pfnIndexOfEdict(pEntity);
-    if (index > 0 && index <= 32) {
-        g_ApprovedSteamID[index][0] = '\0'; 
-        g_PlayerState[index] = STATE_DISCONNECTED;
-    }
-    RETURN_META(MRES_IGNORED);
-}
-
 C_DLLEXPORT int GetEntityAPI(DLL_FUNCTIONS *pFunctionTable, int interfaceVersion) {
     if (!pFunctionTable) return FALSE;
     memset(pFunctionTable, 0, sizeof(DLL_FUNCTIONS));
     pFunctionTable->pfnClientConnect = ClientConnect_Hook;
-    pFunctionTable->pfnClientDisconnect = ClientDisconnect_Hook;
-    pFunctionTable->pfnStartFrame = StartFrame_Hook;
     return TRUE;
 }
 
