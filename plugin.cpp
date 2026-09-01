@@ -27,18 +27,12 @@ mutil_funcs_t *gpMetaUtilFuncs;
 enginefuncs_t g_engfuncs;
 globalvars_t *gpGlobals;
 
-// ReHLDS API Pointers
+// Correct ReHLDS API Pointers
 IRehldsApi* g_RehldsApi = nullptr;
-IRehldsServerData* g_RehldsData = nullptr;
-
-enum AuthState {
-    STATE_DISCONNECTED = 0,
-    STATE_WAITING_FOR_REUNION,
-    STATE_AUTHENTICATED
-};
+IRehldsServerStatic* g_RehldsStatic = nullptr;
+IRehldsHookchains* g_Hookchains = nullptr;
 
 char g_ApprovedSteamID[33][32] = {0};
-AuthState g_PlayerState[33] = {STATE_DISCONNECTED};
 
 C_DLLEXPORT void WINAPI GiveFnptrsToDll(enginefuncs_t* pengfuncsFromEngine, globalvars_t *pGlobals) {
     memcpy(&g_engfuncs, pengfuncsFromEngine, sizeof(enginefuncs_t));
@@ -46,7 +40,7 @@ C_DLLEXPORT void WINAPI GiveFnptrsToDll(enginefuncs_t* pengfuncsFromEngine, glob
 }
 
 // ------------------------------------------------------------------------
-// ReHLDS Factory Loader (Cross-Platform)
+// Cross-Platform ReHLDS Factory Loader
 // ------------------------------------------------------------------------
 typedef void* (*CreateInterfaceFn)(const char *pName, int *pReturnCode);
 CreateInterfaceFn GetEngineFactory() {
@@ -65,14 +59,11 @@ CreateInterfaceFn GetEngineFactory() {
 }
 
 // ------------------------------------------------------------------------
-// STEP 1: Catch connection & fetch from Redis
+// 1. Initial Connection: Fetch ID from Redis
 // ------------------------------------------------------------------------
 qboolean ClientConnect_Hook(edict_t *pEntity, const char *pszName, const char *pszAddress, char szRejectReason[128]) {
     int index = g_engfuncs.pfnIndexOfEdict(pEntity);
-    if (index > 0 && index <= 32) {
-        g_ApprovedSteamID[index][0] = '\0';
-        g_PlayerState[index] = STATE_DISCONNECTED;
-    }
+    if (index > 0 && index <= 32) g_ApprovedSteamID[index][0] = '\0';
 
     if (!redis || redis->err) {
         RETURN_META_VALUE(MRES_IGNORED, TRUE); 
@@ -109,7 +100,6 @@ qboolean ClientConnect_Hook(edict_t *pEntity, const char *pszName, const char *p
             if (index > 0 && index <= 32) {
                 strncpy(g_ApprovedSteamID[index], extractedSteamId, 31);
                 g_ApprovedSteamID[index][31] = '\0';
-                g_PlayerState[index] = STATE_WAITING_FOR_REUNION;
             }
             freeReplyObject(reply);
             RETURN_META_VALUE(MRES_IGNORED, TRUE); 
@@ -125,65 +115,41 @@ qboolean ClientConnect_Hook(edict_t *pEntity, const char *pszName, const char *p
     }
 }
 
-// ------------------------------------------------------------------------
-// STEP 2: The True ReHLDS Memory Stomp
-// ------------------------------------------------------------------------
-void StompAuthID(int index) {
-    if (!g_RehldsData) return;
-    
-    if (index > 0 && index <= 32 && g_PlayerState[index] == STATE_WAITING_FOR_REUNION) {
-        
-        // ReHLDS GetClient expects a 0-based index (0 to 31)
-        IRehldsClient* pClient = g_RehldsData->GetClient(index - 1);
-        
-        if (pClient && pClient->IsConnected()) {
-            
-            // Bypass Metamod completely and fetch the exact memory pointer from the ReHLDS engine
-            char* engine_authid = const_cast<char*>(pClient->GetAuthId());
-            
-            // If Reunion has finished generating its dummy ID and it is no longer PENDING...
-            if (engine_authid && 
-                strcmp(engine_authid, "STEAM_ID_PENDING") != 0 && 
-                strcmp(engine_authid, "BOT") != 0 && 
-                engine_authid[0] != '\0') 
-            {
-                gpMetaUtilFuncs->pfnLogConsole(PLID, "[WebAuth] Reunion finished! Stomping '%s' with Redis ID '%s'\n", engine_authid, g_ApprovedSteamID[index]);
-                
-                // Write directly into ReHLDS core memory
-                strncpy(engine_authid, g_ApprovedSteamID[index], 31);
-                engine_authid[31] = '\0';
-                
-                g_PlayerState[index] = STATE_AUTHENTICATED;
-            }
-        }
-    }
-}
-
-// Surround AMX Mod X on all fronts to guarantee we stomp before it reads
-void ClientUserInfoChanged_Hook(edict_t *pEntity, char *infobuffer) {
-    StompAuthID(g_engfuncs.pfnIndexOfEdict(pEntity));
-    RETURN_META(MRES_IGNORED);
-}
-
-void PlayerPreThink_Hook(edict_t *pEntity) {
-    StompAuthID(g_engfuncs.pfnIndexOfEdict(pEntity));
-    RETURN_META(MRES_IGNORED);
-}
-
-void StartFrame_Hook() {
-    for (int i = 1; i <= gpGlobals->maxClients; i++) {
-        StompAuthID(i);
-    }
-    RETURN_META(MRES_IGNORED);
-}
-
 void ClientDisconnect_Hook(edict_t *pEntity) {
     int index = g_engfuncs.pfnIndexOfEdict(pEntity);
-    if (index > 0 && index <= 32) {
-        g_ApprovedSteamID[index][0] = '\0'; 
-        g_PlayerState[index] = STATE_DISCONNECTED;
-    }
+    if (index > 0 && index <= 32) g_ApprovedSteamID[index][0] = '\0'; 
     RETURN_META(MRES_IGNORED);
+}
+
+// ------------------------------------------------------------------------
+// 2. The ReHLDS Native Hook: Intercept Reunion's string dynamically
+// ------------------------------------------------------------------------
+class IGameClient; // Forward declare the client class to bypass layout issues
+
+// We catch the ReHLDS Certificate Check right after Reunion generates its dummy ID.
+void SV_FinishCertificateCheck_Hook(IRehldsHook_SV_FinishCertificateCheck* chain, IGameClient* cl, int bIsLegit, const char* authid) {
+    if (!g_RehldsStatic) {
+        chain->callNext(cl, bIsLegit, authid);
+        return;
+    }
+
+    int index = -1;
+    // Compare the opaque pointer against ReHLDS to find the player index
+    for (int i = 0; i < gpGlobals->maxClients; i++) {
+        if (g_RehldsStatic->GetClient(i) == cl) {
+            index = i + 1;
+            break;
+        }
+    }
+
+    if (index > 0 && index <= 32 && g_ApprovedSteamID[index][0] != '\0') {
+        // We intercept Reunion's dummy "authid" and substitute it with our Redis ID.
+        // When callNext() runs, AMX Mod X and the Engine officially receive our Redis ID!
+        chain->callNext(cl, bIsLegit, g_ApprovedSteamID[index]);
+    } else {
+        // Pass the original ID through if they aren't authenticated
+        chain->callNext(cl, bIsLegit, authid);
+    }
 }
 
 C_DLLEXPORT int GetEntityAPI(DLL_FUNCTIONS *pFunctionTable, int interfaceVersion) {
@@ -191,9 +157,6 @@ C_DLLEXPORT int GetEntityAPI(DLL_FUNCTIONS *pFunctionTable, int interfaceVersion
     memset(pFunctionTable, 0, sizeof(DLL_FUNCTIONS));
     pFunctionTable->pfnClientConnect = ClientConnect_Hook;
     pFunctionTable->pfnClientDisconnect = ClientDisconnect_Hook;
-    pFunctionTable->pfnClientUserInfoChanged = ClientUserInfoChanged_Hook;
-    pFunctionTable->pfnPlayerPreThink = PlayerPreThink_Hook;
-    pFunctionTable->pfnStartFrame = StartFrame_Hook;
     return TRUE;
 }
 
@@ -212,17 +175,22 @@ C_DLLEXPORT int Meta_Attach(PLUG_LOADTIME now, META_FUNCTIONS *pFunctionTable, m
     WSAStartup(MAKEWORD(2,2), &wsaData);
 #endif
 
-    // Hook directly into the ReHLDS API
+    // Hook ReHLDS Native API
     CreateInterfaceFn factory = GetEngineFactory();
     if (factory) {
         int ret;
         g_RehldsApi = (IRehldsApi*)factory("VREHLDS_API_VERSION001", &ret);
         if (g_RehldsApi) {
-            g_RehldsData = g_RehldsApi->GetServerData();
-            gpMetaUtilFuncs->pfnLogConsole(PLID, "[WebAuth] ReHLDS API successfully linked!\n");
+            g_Hookchains = g_RehldsApi->GetHookchains();
+            g_RehldsStatic = g_RehldsApi->GetServerStatic();
+            
+            if (g_Hookchains && g_RehldsStatic) {
+                g_Hookchains->SV_FinishCertificateCheck()->registerHook(SV_FinishCertificateCheck_Hook);
+                gpMetaUtilFuncs->pfnLogConsole(PLID, "[WebAuth] ReHLDS Native Interceptor Registered!\n");
+            }
         }
     } else {
-        gpMetaUtilFuncs->pfnLogConsole(PLID, "[WebAuth] WARNING: Could not hook ReHLDS API.\n");
+        gpMetaUtilFuncs->pfnLogConsole(PLID, "[WebAuth] WARNING: Could not link ReHLDS API.\n");
     }
 
     redis = redisConnect("127.0.0.1", 6379);
@@ -240,5 +208,8 @@ C_DLLEXPORT int Meta_Detach(PLUG_LOADTIME now, PL_UNLOAD_REASON reason) {
 #ifdef _WIN32
     WSACleanup();
 #endif
+    if (g_Hookchains) {
+        g_Hookchains->SV_FinishCertificateCheck()->unregisterHook(SV_FinishCertificateCheck_Hook);
+    }
     return TRUE;
 }
