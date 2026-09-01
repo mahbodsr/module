@@ -23,21 +23,12 @@ mutil_funcs_t *gpMetaUtilFuncs;
 enginefuncs_t g_engfuncs;
 globalvars_t *gpGlobals;
 
-// Store the approved Redis ID for each slot
-char g_ApprovedSteamID[33][32] = {0};
-
 C_DLLEXPORT void WINAPI GiveFnptrsToDll(enginefuncs_t* pengfuncsFromEngine, globalvars_t *pGlobals) {
     memcpy(&g_engfuncs, pengfuncsFromEngine, sizeof(enginefuncs_t));
     gpGlobals = pGlobals;
 }
 
-// 1. Connection Hook: Validate Redis and save the ID
 qboolean ClientConnect_Hook(edict_t *pEntity, const char *pszName, const char *pszAddress, char szRejectReason[128]) {
-    int index = g_engfuncs.pfnIndexOfEdict(pEntity);
-    if (index > 0 && index <= 32) {
-        g_ApprovedSteamID[index][0] = '\0';
-    }
-
     if (!redis || redis->err) {
         RETURN_META_VALUE(MRES_IGNORED, TRUE); 
     }
@@ -70,12 +61,17 @@ qboolean ClientConnect_Hook(edict_t *pEntity, const char *pszName, const char *p
         }
 
         if (extractedSteamId[0] != '\0') {
-            if (index > 0 && index <= 32) {
-                strncpy(g_ApprovedSteamID[index], extractedSteamId, 31);
-                g_ApprovedSteamID[index][31] = '\0';
+            
+            // THE DIRECT ASSIGNMENT:
+            // Bypass the read-only lock and forcefully write the Redis ID into the engine's memory.
+            char* engine_authid = (char*)g_engfuncs.pfnGetPlayerAuthId(pEntity);
+            if (engine_authid) {
+                strncpy(engine_authid, extractedSteamId, 31);
+                engine_authid[31] = '\0';
             }
+
             freeReplyObject(reply);
-            RETURN_META_VALUE(MRES_IGNORED, TRUE); 
+            RETURN_META_VALUE(MRES_IGNORED, TRUE); // Let them join
         } else {
             if (reply) freeReplyObject(reply);
             strncpy(szRejectReason, "Invalid session data format!", 127);
@@ -88,43 +84,10 @@ qboolean ClientConnect_Hook(edict_t *pEntity, const char *pszName, const char *p
     }
 }
 
-void ClientDisconnect_Hook(edict_t *pEntity) {
-    int index = g_engfuncs.pfnIndexOfEdict(pEntity);
-    if (index > 0 && index <= 32) {
-        g_ApprovedSteamID[index][0] = '\0'; 
-    }
-    RETURN_META(MRES_IGNORED);
-}
-
-// ==============================================================================
-// THE FIX: Intercept AMX Mod X's attempts to read the SteamID from the engine.
-// ==============================================================================
-const char* Hook_GetPlayerAuthId(edict_t *pEdict) {
-    int index = g_engfuncs.pfnIndexOfEdict(pEdict);
-    
-    if (index > 0 && index <= 32 && g_ApprovedSteamID[index][0] != '\0') {
-        // SUPERCEDE means we block AMX Mod X from reading the real memory 
-        // and force it to accept our Redis SteamID instead.
-        RETURN_META_VALUE(MRES_SUPERCEDE, g_ApprovedSteamID[index]);
-    }
-    
-    // If they don't have a Redis ID, let the engine function proceed normally
-    RETURN_META_VALUE(MRES_IGNORED, nullptr);
-}
-
 C_DLLEXPORT int GetEntityAPI(DLL_FUNCTIONS *pFunctionTable, int interfaceVersion) {
     if (!pFunctionTable) return FALSE;
     memset(pFunctionTable, 0, sizeof(DLL_FUNCTIONS));
     pFunctionTable->pfnClientConnect = ClientConnect_Hook;
-    pFunctionTable->pfnClientDisconnect = ClientDisconnect_Hook;
-    return TRUE;
-}
-
-// Register our Engine Hooks (Fixed function name)
-C_DLLEXPORT int GetEngineFunctions(enginefuncs_t *pengfuncsFromEngine, int *interfaceVersion) {
-    if (!pengfuncsFromEngine) return FALSE;
-    memset(pengfuncsFromEngine, 0, sizeof(enginefuncs_t));
-    pengfuncsFromEngine->pfnGetPlayerAuthId = Hook_GetPlayerAuthId;
     return TRUE;
 }
 
@@ -149,9 +112,7 @@ C_DLLEXPORT int Meta_Attach(PLUG_LOADTIME now, META_FUNCTIONS *pFunctionTable, m
         return FALSE;
     }
 
-    // Tell Metamod we have both Entity hooks and Engine hooks (Fixed member name)
     pFunctionTable->pfnGetEntityAPI = GetEntityAPI;
-    pFunctionTable->pfnGetEngineFunctions = GetEngineFunctions;
     return TRUE;
 }
 
