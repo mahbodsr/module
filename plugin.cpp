@@ -23,26 +23,19 @@ mutil_funcs_t *gpMetaUtilFuncs;
 enginefuncs_t g_engfuncs;
 globalvars_t *gpGlobals;
 
-enum AuthState {
-    STATE_DISCONNECTED = 0,
-    STATE_WAITING_FOR_REUNION,
-    STATE_AUTHENTICATED
-};
-
+// Store the approved Redis ID for each slot
 char g_ApprovedSteamID[33][32] = {0};
-AuthState g_PlayerState[33] = {STATE_DISCONNECTED};
 
 C_DLLEXPORT void WINAPI GiveFnptrsToDll(enginefuncs_t* pengfuncsFromEngine, globalvars_t *pGlobals) {
     memcpy(&g_engfuncs, pengfuncsFromEngine, sizeof(enginefuncs_t));
     gpGlobals = pGlobals;
 }
 
-// 1. Initial Connection: Check Redis
+// 1. Connection Hook: Validate Redis and save the ID
 qboolean ClientConnect_Hook(edict_t *pEntity, const char *pszName, const char *pszAddress, char szRejectReason[128]) {
     int index = g_engfuncs.pfnIndexOfEdict(pEntity);
     if (index > 0 && index <= 32) {
         g_ApprovedSteamID[index][0] = '\0';
-        g_PlayerState[index] = STATE_DISCONNECTED;
     }
 
     if (!redis || redis->err) {
@@ -80,7 +73,6 @@ qboolean ClientConnect_Hook(edict_t *pEntity, const char *pszName, const char *p
             if (index > 0 && index <= 32) {
                 strncpy(g_ApprovedSteamID[index], extractedSteamId, 31);
                 g_ApprovedSteamID[index][31] = '\0';
-                g_PlayerState[index] = STATE_WAITING_FOR_REUNION;
             }
             freeReplyObject(reply);
             RETURN_META_VALUE(MRES_IGNORED, TRUE); 
@@ -96,63 +88,43 @@ qboolean ClientConnect_Hook(edict_t *pEntity, const char *pszName, const char *p
     }
 }
 
-// 2. The Universal Enforcer Logic
-void StompAuthID(edict_t *pEntity, int index) {
-    if (index > 0 && index <= 32 && g_PlayerState[index] == STATE_WAITING_FOR_REUNION) {
-        char* engine_authid = (char*)g_engfuncs.pfnGetPlayerAuthId(pEntity);
-        
-        // The exact millisecond Reunion changes it from PENDING to a Dummy ID...
-        if (engine_authid && strcmp(engine_authid, "STEAM_ID_PENDING") != 0 && strcmp(engine_authid, "BOT") != 0 && engine_authid[0] != '\0') {
-            
-            // Stomp it with our Redis ID
-            strncpy(engine_authid, g_ApprovedSteamID[index], 31);
-            engine_authid[31] = '\0';
-            
-            // Lock it so we stop checking and save CPU
-            g_PlayerState[index] = STATE_AUTHENTICATED;
-        }
-    }
-}
-
-// 3. Surround AMX Mod X on all polling fronts
-void ClientUserInfoChanged_Hook(edict_t *pEntity, char *infobuffer) {
-    StompAuthID(pEntity, g_engfuncs.pfnIndexOfEdict(pEntity));
-    RETURN_META(MRES_IGNORED);
-}
-
-void PlayerPreThink_Hook(edict_t *pEntity) {
-    StompAuthID(pEntity, g_engfuncs.pfnIndexOfEdict(pEntity));
-    RETURN_META(MRES_IGNORED);
-}
-
-void StartFrame_Hook() {
-    for (int i = 1; i <= gpGlobals->maxClients; i++) {
-        edict_t* pEntity = g_engfuncs.pfnPEntityOfEntIndex(i);
-        if (pEntity && !pEntity->free) {
-            StompAuthID(pEntity, i);
-        }
-    }
-    RETURN_META(MRES_IGNORED);
-}
-
 void ClientDisconnect_Hook(edict_t *pEntity) {
     int index = g_engfuncs.pfnIndexOfEdict(pEntity);
     if (index > 0 && index <= 32) {
         g_ApprovedSteamID[index][0] = '\0'; 
-        g_PlayerState[index] = STATE_DISCONNECTED;
     }
     RETURN_META(MRES_IGNORED);
 }
 
-// 4. Register the Wall
+// ==============================================================================
+// THE FIX: Intercept AMX Mod X's attempts to read the SteamID from the engine.
+// ==============================================================================
+const char* Hook_GetPlayerAuthId(edict_t *pEdict) {
+    int index = g_engfuncs.pfnIndexOfEdict(pEdict);
+    
+    if (index > 0 && index <= 32 && g_ApprovedSteamID[index][0] != '\0') {
+        // SUPERCEDE means we block AMX Mod X from reading the real memory 
+        // and force it to accept our Redis SteamID instead.
+        RETURN_META_VALUE(MRES_SUPERCEDE, g_ApprovedSteamID[index]);
+    }
+    
+    // If they don't have a Redis ID, let the engine function proceed normally
+    RETURN_META_VALUE(MRES_IGNORED, nullptr);
+}
+
 C_DLLEXPORT int GetEntityAPI(DLL_FUNCTIONS *pFunctionTable, int interfaceVersion) {
     if (!pFunctionTable) return FALSE;
     memset(pFunctionTable, 0, sizeof(DLL_FUNCTIONS));
     pFunctionTable->pfnClientConnect = ClientConnect_Hook;
     pFunctionTable->pfnClientDisconnect = ClientDisconnect_Hook;
-    pFunctionTable->pfnClientUserInfoChanged = ClientUserInfoChanged_Hook;
-    pFunctionTable->pfnPlayerPreThink = PlayerPreThink_Hook;
-    pFunctionTable->pfnStartFrame = StartFrame_Hook;
+    return TRUE;
+}
+
+// Register our Engine Hooks
+C_DLLEXPORT int GetEngineAPI(enginefuncs_t *pengfuncsFromEngine, int *interfaceVersion) {
+    if (!pengfuncsFromEngine) return FALSE;
+    memset(pengfuncsFromEngine, 0, sizeof(enginefuncs_t));
+    pengfuncsFromEngine->pfnGetPlayerAuthId = Hook_GetPlayerAuthId;
     return TRUE;
 }
 
@@ -177,7 +149,9 @@ C_DLLEXPORT int Meta_Attach(PLUG_LOADTIME now, META_FUNCTIONS *pFunctionTable, m
         return FALSE;
     }
 
+    // Tell Metamod we have both Entity hooks and Engine hooks
     pFunctionTable->pfnGetEntityAPI = GetEntityAPI;
+    pFunctionTable->pfnGetEngineAPI = GetEngineAPI;
     return TRUE;
 }
 
