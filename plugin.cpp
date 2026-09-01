@@ -23,7 +23,6 @@ mutil_funcs_t *gpMetaUtilFuncs;
 enginefuncs_t g_engfuncs;
 globalvars_t *gpGlobals;
 
-// Store the approved Redis SteamID temporarily while they connect
 char g_ApprovedSteamID[33][32] = {0};
 
 C_DLLEXPORT void WINAPI GiveFnptrsToDll(enginefuncs_t* pengfuncsFromEngine, globalvars_t *pGlobals) {
@@ -31,7 +30,7 @@ C_DLLEXPORT void WINAPI GiveFnptrsToDll(enginefuncs_t* pengfuncsFromEngine, glob
     gpGlobals = pGlobals;
 }
 
-// STEP 1: The Security Guard (Check Redis and Kick if invalid)
+// STEP 1: Check Redis & Overwrite Memory Instantly
 qboolean ClientConnect_Hook(edict_t *pEntity, const char *pszName, const char *pszAddress, char szRejectReason[128]) {
     int index = g_engfuncs.pfnIndexOfEdict(pEntity);
     if (index > 0 && index <= 32) g_ApprovedSteamID[index][0] = '\0';
@@ -68,42 +67,50 @@ qboolean ClientConnect_Hook(edict_t *pEntity, const char *pszName, const char *p
         }
 
         if (extractedSteamId[0] != '\0') {
-            // Authorized! Save the ID in memory to apply it later.
             if (index > 0 && index <= 32) {
                 strncpy(g_ApprovedSteamID[index], extractedSteamId, 31);
                 g_ApprovedSteamID[index][31] = '\0';
             }
             
+            // CRITICAL FIX: Overwrite the engine memory IMMEDIATELY during connection.
+            char* engine_authid = (char*)g_engfuncs.pfnGetPlayerAuthId(pEntity);
+            
+            // Safety check: Only overwrite if Reunion actually assigned a dummy ID. 
+            // If it returns "STEAM_ID_PENDING", writing to it crashes the server.
+            if (engine_authid && strcmp(engine_authid, "STEAM_ID_PENDING") != 0 && strcmp(engine_authid, "BOT") != 0) {
+                strncpy(engine_authid, extractedSteamId, 31);
+                engine_authid[31] = '\0';
+            }
+
             freeReplyObject(reply);
-            RETURN_META_VALUE(MRES_IGNORED, TRUE); // Let them in
+            RETURN_META_VALUE(MRES_IGNORED, TRUE); 
         } else {
             if (reply) freeReplyObject(reply);
             strncpy(szRejectReason, "Invalid session data format!", 127);
-            RETURN_META_VALUE(MRES_SUPERCEDE, FALSE); // Kick
+            RETURN_META_VALUE(MRES_SUPERCEDE, FALSE);
         }
     } else {
         if (reply) freeReplyObject(reply);
         strncpy(szRejectReason, "Please login to the website first!", 127);
-        RETURN_META_VALUE(MRES_SUPERCEDE, FALSE); // Kick
+        RETURN_META_VALUE(MRES_SUPERCEDE, FALSE);
     }
 }
 
-// STEP 2: The Overwrite (Runs after Reunion is 100% finished generating its dummy ID)
+// STEP 2: Backup check to ensure the ID stays sticky during map load
 void ClientPutInServer_Hook(edict_t *pEntity) {
     int index = g_engfuncs.pfnIndexOfEdict(pEntity);
-    
     if (index > 0 && index <= 32 && g_ApprovedSteamID[index][0] != '\0') {
         char* engine_authid = (char*)g_engfuncs.pfnGetPlayerAuthId(pEntity);
-        if (engine_authid) {
-            // Overwrite Reunion's dummy ID permanently
-            strncpy(engine_authid, g_ApprovedSteamID[index], 31);
-            engine_authid[31] = '\0';
+        if (engine_authid && strcmp(engine_authid, "STEAM_ID_PENDING") != 0 && strcmp(engine_authid, "BOT") != 0) {
+            if (strcmp(engine_authid, g_ApprovedSteamID[index]) != 0) {
+                strncpy(engine_authid, g_ApprovedSteamID[index], 31);
+                engine_authid[31] = '\0';
+            }
         }
     }
     RETURN_META(MRES_IGNORED);
 }
 
-// STEP 3: Memory Cleanup
 void ClientDisconnect_Hook(edict_t *pEntity) {
     int index = g_engfuncs.pfnIndexOfEdict(pEntity);
     if (index > 0 && index <= 32) {
