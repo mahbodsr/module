@@ -18,26 +18,33 @@ plugin_info_t Plugin_info = {
 
 redisContext* redis = nullptr;
 
-// Standard Metamod Globals
 meta_globals_t *gpMetaGlobals;
 gamedll_funcs_t *gpGamedllFuncs;
 mutil_funcs_t *gpMetaUtilFuncs;
 enginefuncs_t g_engfuncs;
 globalvars_t *gpGlobals;
 
-// The Half-Life engine requires this function to pass us its engine functions
 C_DLLEXPORT void WINAPI GiveFnptrsToDll(enginefuncs_t* pengfuncsFromEngine, globalvars_t *pGlobals) {
     memcpy(&g_engfuncs, pengfuncsFromEngine, sizeof(enginefuncs_t));
     gpGlobals = pGlobals;
 }
 
-// Our Metamod Hook for Player Connections
+// Hook to override SteamID for API requests (AMXX, etc.)
+const char* GetPlayerAuthId_Hook(edict_t *pEntity) {
+    if (!pEntity || pEntity->v.flags & FL_DORMANT) {
+        RETURN_META_VALUE(MRES_IGNORED, NULL);
+    }
+    const char* webAuthId = g_engfuncs.pfnInfoKeyValue(g_engfuncs.pfnGetInfoKeyBuffer(pEntity), "*web_auth_id");
+    if (webAuthId && webAuthId[0] != '\0') {
+        RETURN_META_VALUE(MRES_SUPERCEDE, webAuthId);
+    }
+    RETURN_META_VALUE(MRES_IGNORED, NULL);
+}
+
 qboolean ClientConnect_Hook(edict_t *pEntity, const char *pszName, const char *pszAddress, char szRejectReason[128]) {
     if (!redis || redis->err) {
-        RETURN_META_VALUE(MRES_IGNORED, TRUE); // Failsafe: let them in if Redis is completely down
+        RETURN_META_VALUE(MRES_IGNORED, TRUE); 
     }
-
-    // Metamod provides the IP with the port (e.g., 192.168.1.5:27005). We must strip the port.
     char ip[64];
     strncpy(ip, pszAddress, sizeof(ip) - 1);
     ip[sizeof(ip) - 1] = '\0';
@@ -47,28 +54,40 @@ qboolean ClientConnect_Hook(edict_t *pEntity, const char *pszName, const char *p
     redisReply* reply = (redisReply*)redisCommand(redis, "GET session:%s", ip);
     
     if (reply != nullptr && reply->type == REDIS_REPLY_STRING) {
-        // Player is authenticated! 
-        // We write their AuthID into the engine's Info Buffer so AMX Mod X can read it easily.
+        // 1. Set the info buffer so our API hook and AMXX plugins can use it safely
         g_engfuncs.pfnSetClientKeyValue(ENTINDEX(pEntity), g_engfuncs.pfnGetInfoKeyBuffer(pEntity), "*web_auth_id", reply->str);
         
+        // 2. FORCE OVERWRITE the engine's internal AuthID buffer.
+        // This is what the native "status" command reads from.
+        const char* engineAuthId = g_engfuncs.pfnGetPlayerAuthId(pEntity);
+        if (engineAuthId) {
+            // We cast away 'const' to modify the internal client_t structure in-place.
+            // ReHLDS/HLDS max authid length is typically 64 bytes.
+            strncpy((char*)engineAuthId, reply->str, 63); 
+            ((char*)engineAuthId)[63] = '\0';
+        }
+
         freeReplyObject(reply);
-        RETURN_META_VALUE(MRES_IGNORED, TRUE); // TRUE = Let them join
+        RETURN_META_VALUE(MRES_IGNORED, TRUE);
     } else {
-        // Player not found in Redis
         if (reply) freeReplyObject(reply);
-        
         strncpy(szRejectReason, "Please login to the website first!", 127);
         szRejectReason[127] = '\0';
-        
-        RETURN_META_VALUE(MRES_SUPERCEDE, FALSE); // FALSE = Reject connection & show reason
+        RETURN_META_VALUE(MRES_SUPERCEDE, FALSE);
     }
 }
 
-// Register our hook with Metamod (Fixed the int signature here)
 C_DLLEXPORT int GetEntityAPI(DLL_FUNCTIONS *pFunctionTable, int interfaceVersion) {
     if (!pFunctionTable) return FALSE;
     memset(pFunctionTable, 0, sizeof(DLL_FUNCTIONS));
     pFunctionTable->pfnClientConnect = ClientConnect_Hook;
+    return TRUE;
+}
+
+C_DLLEXPORT int GetEngineFunctions(enginefuncs_t *pengfuncsFromEngine, int *interfaceVersion) {
+    if (!pengfuncsFromEngine) return FALSE;
+    memset(pengfuncsFromEngine, 0, sizeof(enginefuncs_t));
+    pengfuncsFromEngine->pfnGetPlayerAuthId = GetPlayerAuthId_Hook;
     return TRUE;
 }
 
@@ -94,12 +113,12 @@ C_DLLEXPORT int Meta_Attach(PLUG_LOADTIME now, META_FUNCTIONS *pFunctionTable, m
     }
 
     pFunctionTable->pfnGetEntityAPI = GetEntityAPI;
+    pFunctionTable->pfnGetEngineFunctions = GetEngineFunctions;
     return TRUE;
 }
 
 C_DLLEXPORT int Meta_Detach(PLUG_LOADTIME now, PL_UNLOAD_REASON reason) {
     if (redis) redisFree(redis);
-
 #ifdef _WIN32
     WSACleanup();
 #endif
